@@ -183,16 +183,17 @@ pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, return_add
     const fl, const sl = self.findFreeLevels(n) orelse return null; // not enough free room
     const list = self.free_lists[fl][sl] orelse std.process.fatal("Allocator lib bug: Bitmap does not match list! (size={d}, alignment='{s}', ret_addr={X:0>8})\n", .{ n, @tagName(alignment), return_address });
     list.remove();
-    const allocation_addr = @intFromPtr(list);
-    const move = std.mem.alignForward(usize, allocation_addr, alignment.toByteUnits());
-    self.insertInList(allocation_addr, move);
+    const raw_allocation_addr = @intFromPtr(list);
+    const aligned_addr = std.mem.alignForward(usize, raw_allocation_addr, alignment.toByteUnits());
+    const padding = @abs(aligned_addr - raw_allocation_addr); // abs needed due to differing address growing directions, right??
+    self.insertInList(raw_allocation_addr, padding);
 
     const block_size = self.sizeFromLevels(fl, sl);
     const remaining_space = block_size - n;
-    self.insertInList(allocation_addr + move + n, remaining_space);
+    self.insertInList(aligned_addr + n, remaining_space);
 
     self.free_lists[fl][sl] = null; // clear now used list
-    return @ptrFromInt(allocation_addr + move);
+    return @ptrFromInt(aligned_addr);
 }
 
 pub fn resize(
@@ -235,6 +236,8 @@ pub fn free(
 ) void {
     // TODO: is it even possible to recapture "lost" space?
     const self: *StaticAllocator = @ptrCast(@alignCast(ctx));
+    const addr = memory.ptr;
+
     _ = self;
     _ = buf;
     _ = alignment;
