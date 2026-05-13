@@ -14,12 +14,14 @@ const StaticAllocator = @This();
 const BlockHeader = struct {
     next_block: ?*BlockHeader = null,
     prev_block: ?*BlockHeader = null,
+    size: usize,
 
-    pub fn init(addr: usize, prev_block: ?*BlockHeader) *BlockHeader {
+    pub fn init(addr: usize, size: usize, prev_block: ?*BlockHeader) *BlockHeader {
         const ptr: *BlockHeader = @ptrFromInt(addr);
         ptr.* = BlockHeader{
             .next_block = null,
             .prev_block = prev_block,
+            .siez = size,
         };
         return ptr;
     }
@@ -32,6 +34,10 @@ const BlockHeader = struct {
                 prev_block.*.next_block = null;
             }
         }
+    }
+
+    inline fn addr(self: *const BlockHeader) usize {
+        @intFromPtr(self);
     }
 };
 
@@ -77,6 +83,7 @@ inline fn upperBound(size: usize) usize {
 // Sl = (size-lowerBoundOf(size)) / (lowerBoundOf(size) / SL_COUNT)
 // where:
 //  lowerBoundOf(size) = 2^(floor(log2(size)))
+/// Find closest matching bin
 fn sizeToLevels(self: *const StaticAllocator, size: usize) struct { Fl, Sl } {
     const lower_bound = lowerBound(size);
 
@@ -168,7 +175,7 @@ pub fn allocator(self: *StaticAllocator) Allocator {
 
 /// Insert some bytes of allocated memory in list
 fn insertInList(self: *StaticAllocator, addr: usize, n: usize) void {
-    if (n < @sizeOf(BlockHeader)) return; // can't allocate anyways. Any potential lost bytes here should be recaptured in `free` (if that is even possible)
+    std.debug.assert(n >= @sizeOf(BlockHeader));
     const fl, const sl = self.sizeToLevels(n);
     if (self.free_lists[fl][sl]) |list| {
         self.free_lists[fl][sl] = BlockHeader.init(addr, list);
@@ -180,17 +187,52 @@ fn insertInList(self: *StaticAllocator, addr: usize, n: usize) void {
 pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
     const self: *StaticAllocator = @ptrCast(@alignCast(ctx));
 
-    const fl, const sl = self.findFreeLevels(n) orelse return null; // not enough free room
-    const list = self.free_lists[fl][sl] orelse std.process.fatal("Allocator lib bug: Bitmap does not match list! (size={d}, alignment='{s}', ret_addr={X:0>8})\n", .{ n, @tagName(alignment), return_address });
-    list.remove();
-    const raw_allocation_addr = @intFromPtr(list);
-    const aligned_addr = std.mem.alignForward(usize, raw_allocation_addr, alignment.toByteUnits());
-    const padding = @abs(aligned_addr - raw_allocation_addr); // abs needed due to differing address growing directions, right??
-    self.insertInList(raw_allocation_addr, padding);
+    const min_fl, const min_sl = self.sizeToLevels(n);
+    const lz_fl = @clz(self.fl_bitmap << min_fl);
+    if (lz_fl == @bitSizeOf(Fl)) return null; // not enough room
+    if (lz_fl == 0) {
+        // possibly an exact match!
+        const fl = lz_fl + min_fl;
+        const lz_sl = @clz(self.sl_bitmaps[fl] << min_sl);
+        const sl = lz_sl + min_sl;
 
-    const block_size = self.sizeFromLevels(fl, sl);
-    const remaining_space = block_size - n;
-    self.insertInList(aligned_addr + n, remaining_space);
+        const block = self.free_lists[fl][sl] orelse @panic("found bug!");
+        const aligned_addr = std.mem.alignForward(usize, block.addr(), alignment);
+        const padding = aligned_addr - block.addr();
+        if (block.size == n and padding == 0) {
+            // perfect match
+        } else if (block.size - n - padding > @sizeOf(StaticAllocator)) {
+            // can fit allocation + new block
+
+        } else {
+            // this block doesn't work for us, find next available block
+            const next_sl = @clz(self.sl_bitmaps[fl] << sl);
+            if (next_sl == @bitSizeOf(Sl)) {
+                // no more sl in this fl, look for next fl
+                const next_fl = @clz(self.fl_bitmap << fl);
+                if (next_fl == @bitSizeOf(Fl)) return null;
+
+                // found fl, repeat check...
+                // ... todo ...
+            } else {
+                // found block, lets check again if it works for us. 
+            }
+        }
+    }
+
+
+
+
+
+    // TODO: Optimization - `if (findExactLevels(n)) { ... }`
+    const required_size = n + @max(@sizeOf(BlockHeader), alignment.toByteUnits() - 1);
+    const fl, const sl = self.findFreeLevels(required_size) orelse return null; // not enough free room
+    const block = self.free_lists[fl][sl] orelse std.process.fatal("Allocator lib bug: Bitmap does not match list! (size={d}, alignment='{s}', ret_addr={X:0>8})\n", .{ n, @tagName(alignment), return_address });
+    block.remove(); // remove all references to block
+    const aligned_addr = std.mem.alignForward(usize, block.addr()+@sizeOf(BlockHeader), alignment.toByteUnits());
+    const padding = aligned_addr - block.addr();
+    if (
+    self.insertInList(block.addr(), padding); // add back padding
 
     self.free_lists[fl][sl] = null; // clear now used list
     return @ptrFromInt(aligned_addr);
