@@ -1,3 +1,4 @@
+// TODO: fuzzy test allocator
 const std = @import("std");
 const StaticAllocator = @import("StaticAllocator.zig");
 

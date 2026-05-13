@@ -11,10 +11,32 @@ const StaticAllocator = @This();
 const BlockHeader = struct {
     next_block: ?*BlockHeader = null,
     prev_block: ?*BlockHeader = null,
+
+    pub fn init(addr: usize, prev_block: ?*BlockHeader) *BlockHeader {
+        const ptr: *BlockHeader = @ptrFromInt(addr);
+        ptr.* = BlockHeader{
+            .next_block = null,
+            .prev_block = prev_block,
+        };
+        return ptr;
+    }
+
+    pub fn remove(self: *BlockHeader) void {
+        if (self.prev_block) |prev_block| {
+            if (self.next_block) |next_block| {
+                prev_block.*.next_block = next_block;
+            } else {
+                prev_block.*.next_block = null;
+            }
+        }
+    }
 };
 
 const FlBitmap = std.meta.Int(.unsigned, FL_COUNT);
 const SlBitmap = std.meta.Int(.unsigned, SL_COUNT);
+
+const Fl = std.math.Log2Int(std.meta.Int(.unsigned, FL_COUNT));
+const Sl = std.math.Log2Int(std.meta.Int(.unsigned, SL_COUNT));
 
 // ====================================================================================================
 // Methods
@@ -28,6 +50,9 @@ free_lists: [FL_COUNT][SL_COUNT]?*BlockHeader = @splat(@splat(null)),
 // These bitmaps keep track of which free_lists indices are not null.
 fl_bitmap: FlBitmap = 0,
 sl_bitmaps: [FL_COUNT]SlBitmap = @splat(0),
+
+/// user-provided buffer for allocations
+buffer: []u8,
 
 // ====================================================================================================
 // Methods - Math Helpers
@@ -55,21 +80,53 @@ inline fn upperBound(size: usize) usize {
 //
 // someTransform:
 // lower_bound = 2 ^ floor(log2(size))
-fn sizeToFl(self: *const StaticAllocator, size: usize) usize {
+//
+// Fl = log2(max_block_size) * log2(lowerBoundOf(size))
+fn sizeToFl(self: *const StaticAllocator, size: usize) Fl {
     return std.math.log2(self.max_block_size) * std.math.log2(lowerBound(size));
 }
 
 // 356 => (lower bound) => 256
 // 256 / SL_COUNT = 32
 // (356 - 256) / 32 =
-fn sizeToSl(_: *const StaticAllocator, size: usize) usize {
+//
+// Sl = (size-lowerBoundOf(size)) / (lowerBoundOf(size) / SL_COUNT)
+// where:
+//  lowerBoundOf(size) = 2^(floor(log2(size)))
+fn sizeToSl(_: *const StaticAllocator, size: usize) Sl {
     const lower_bound = lowerBound(size);
     return @divTrunc((size - lower_bound), (lower_bound / SL_COUNT));
+}
+
+// size =
+// (have to reverse above equations)
+fn flToSize(self: *const StaticAllocator, fl: Fl) usize {
+    return TODO;
 }
 
 // ====================================================================================================
 // Methods - "high level"
 // ====================================================================================================
+
+fn findLevels(self: *const StaticAllocator, size: usize) struct { Fl, Sl } {
+    const min_fl = self.sizeToFl(size);
+    const min_sl = self.sizeToSl(size);
+
+    const leading_zeroes_fl = @clz(self.fl_bitmap << min_fl);
+    const fl = min_fl + leading_zeroes_fl;
+    const leading_zeroes_sl = @clz(self.sl_bitmaps[fl] << min_sl);
+    const sl = min_sl + leading_zeroes_sl;
+
+    std.debug.assert(fl <= std.math.maxInt(Fl));
+    std.debug.assert(sl <= std.math.maxInt(Sl));
+
+    return .{ @as(Fl, @intCast(fl)), @as(Sl, @intCast(sl)) };
+}
+
+fn sizeFromLevels(self: *const StaticAllocator, sl: Sl, fl: Fl) usize {
+    const lower_bound_size = self.flToSize(fl);
+    return (lower_bound_size / SL_COUNT) * sl + lower_bound_size;
+}
 
 // ====================================================================================================
 // Configuration Constants (consider moving these to build_config)
@@ -86,6 +143,7 @@ pub const FL_COUNT = 8;
 pub fn init(buffer: []u8) StaticAllocator {
     var self = StaticAllocator{
         .buffer_size = buffer.len,
+        .buffer = buffer,
         .min_block_size = lowerBound(buffer.len) / (std.math.pow(usize, 2, @intCast(FL_COUNT))),
         .max_block_size = upperBound(buffer.len + 1), // bounds are non-inclusive to the upper end, thus the +1
     };
@@ -116,13 +174,38 @@ pub fn allocator(self: *StaticAllocator) Allocator {
     };
 }
 
-pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
     const self: *StaticAllocator = @ptrCast(@alignCast(ctx));
-    _ = self;
-    _ = n;
-    _ = alignment;
-    _ = ra;
-    return null;
+
+    const fl, const sl = self.findLevels(n);
+    const list = self.free_lists[fl][sl] orelse std.process.fatal("Allocator lib bug: Bitmap does not match list! (size={d}, alignment='{s}', ret_addr={X:0>8})\n", .{ n, @tagName(alignment), return_address });
+    list.remove();
+    const allocation_addr = @as([*]u8, @ptrCast(list));
+    const move = std.mem.alignForward(usize, @intFromPtr(allocation_addr), alignment.toByteUnits());
+
+    if (move > @sizeOf(BlockHeader)) {
+        // update list to contain this new free block of memory.
+
+    }
+    // if `move > 0` and `move < @sizeOf(BlockHeader)` this free memory should be recaptured upon freeing.
+
+    const block_size = self.sizeFromLevels(fl, sl);
+    const remaining_space = block_size - n;
+
+    // we might have more than 0 bytes left, but less than `@sizeOf(BlockHeader)`, in which
+    // case these bytes are temporarily lost and should be "recaptured" in `free`.
+    if (remaining_space > @sizeOf(BlockHeader)) {
+        const fl_new, const sl_new = self.findLevels(remaining_space);
+        const new_block_addr = @intFromPtr(list) + remaining_space;
+        if (self.free_lists[fl_new][sl_new]) |prev| {
+            list.next_block = BlockHeader.init(new_block_addr, prev);
+        } else {
+            self.free_lists[fl_new][sl_new] = BlockHeader.init(new_block_addr, null);
+        }
+    }
+
+    self.free_lists[fl][sl] = null; // clear now used list
+    return allocation_addr + move;
 }
 
 pub fn resize(
@@ -132,12 +215,12 @@ pub fn resize(
     new_size: usize,
     return_address: usize,
 ) bool {
+    _ = return_address; // not used - though may be useful for future debugging
     const self: *StaticAllocator = @ptrCast(@alignCast(ctx));
     _ = self;
     _ = buf;
     _ = alignment;
     _ = new_size;
-    _ = return_address;
     return false;
 }
 
@@ -163,6 +246,7 @@ pub fn free(
     alignment: std.mem.Alignment,
     return_address: usize,
 ) void {
+    // TODO: is it even possible to recapture "lost" space?
     const self: *StaticAllocator = @ptrCast(@alignCast(ctx));
     _ = self;
     _ = buf;
