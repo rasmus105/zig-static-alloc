@@ -70,32 +70,15 @@ inline fn upperBound(size: usize) usize {
 // Methods - TFSC specific math helpers
 // ====================================================================================================
 
-// lowerBound = someTransform(buffer.len);
-// lowerBound = 1024/(2^x)
-// 2^x * lowerBound = 1024
-// 2^x = 1024 * lowerBound
-// x = log2(1024 * lowerBound)
-// since 2^10 = 1024, then (note 2^y = x => y = log2(x))
-// x = 10 * log2(lowerBound)
-//
-// someTransform:
-// lower_bound = 2 ^ floor(log2(size))
-//
 // Fl = log2(max_block_size) * log2(lowerBoundOf(size))
-fn sizeToFl(self: *const StaticAllocator, size: usize) Fl {
-    return std.math.log2(self.max_block_size) * std.math.log2(lowerBound(size));
-}
-
-// 356 => (lower bound) => 256
-// 256 / SL_COUNT = 32
-// (356 - 256) / 32 =
-//
 // Sl = (size-lowerBoundOf(size)) / (lowerBoundOf(size) / SL_COUNT)
 // where:
 //  lowerBoundOf(size) = 2^(floor(log2(size)))
-fn sizeToSl(_: *const StaticAllocator, size: usize) Sl {
+fn sizeToLevels(self: *const StaticAllocator, size: usize) struct { Fl, Sl } {
     const lower_bound = lowerBound(size);
-    return @divTrunc((size - lower_bound), (lower_bound / SL_COUNT));
+    const fl = std.math.log2(self.max_block_size) * std.math.log2(lowerBound(size));
+    const sl = @divTrunc((size - lower_bound), (lower_bound / SL_COUNT));
+    return .{ fl, sl };
 }
 
 // size =
@@ -104,28 +87,34 @@ fn flToSize(self: *const StaticAllocator, fl: Fl) usize {
     return TODO;
 }
 
+fn sizeFromLevels(self: *const StaticAllocator, sl: Sl, fl: Fl) usize {
+    const lower_bound_size = self.flToSize(fl);
+    return (lower_bound_size / SL_COUNT) * sl + lower_bound_size;
+}
+
 // ====================================================================================================
 // Methods - "high level"
 // ====================================================================================================
 
-fn findLevels(self: *const StaticAllocator, size: usize) struct { Fl, Sl } {
-    const min_fl = self.sizeToFl(size);
-    const min_sl = self.sizeToSl(size);
+/// finds Fl/Sl of the buffer with the closest size to allocate `n` bytes
+fn findFreeLevels(self: *const StaticAllocator, n: usize) ?struct { Fl, Sl } {
+    const min_fl, const min_sl = self.sizeToLevels(n);
 
-    const leading_zeroes_fl = @clz(self.fl_bitmap << min_fl);
+    const shifted_fl_bitmap = self.fl_bitmap << min_fl;
+
+    if (shifted_fl_bitmap == 0) return null; // no free room
+    const leading_zeroes_fl = @clz(shifted_fl_bitmap);
     const fl = min_fl + leading_zeroes_fl;
-    const leading_zeroes_sl = @clz(self.sl_bitmaps[fl] << min_sl);
+
+    const shifted_sl_bitmap = self.sl_bitmaps[fl] << min_sl;
+    std.debug.assert(shifted_sl_bitmap != 0); // fl should not have indicated free room here
+    const leading_zeroes_sl = @clz(shifted_sl_bitmap);
     const sl = min_sl + leading_zeroes_sl;
 
     std.debug.assert(fl <= std.math.maxInt(Fl));
     std.debug.assert(sl <= std.math.maxInt(Sl));
 
     return .{ @as(Fl, @intCast(fl)), @as(Sl, @intCast(sl)) };
-}
-
-fn sizeFromLevels(self: *const StaticAllocator, sl: Sl, fl: Fl) usize {
-    const lower_bound_size = self.flToSize(fl);
-    return (lower_bound_size / SL_COUNT) * sl + lower_bound_size;
 }
 
 // ====================================================================================================
@@ -151,8 +140,7 @@ pub fn init(buffer: []u8) StaticAllocator {
     const first_block: *BlockHeader = &buffer[0];
     first_block.* = .{};
 
-    const fl = self.sizeToFl(buffer.len);
-    const sl = self.sizeToSl(buffer.len);
+    const fl, const sl = self.sizeToLevels(buffer.len);
 
     // only 1 block
     self.free_lists[fl][sl] = first_block;
@@ -174,38 +162,33 @@ pub fn allocator(self: *StaticAllocator) Allocator {
     };
 }
 
+/// Insert some bytes of allocated memory in list
+fn insertInList(self: *StaticAllocator, addr: usize, n: usize) void {
+    if (n < @sizeOf(BlockHeader)) return; // can't allocate anyways. Any potential lost bytes here should be recaptured in `free` (if that is even possible)
+    const fl, const sl = self.sizeToLevels(n);
+    if (self.free_lists[fl][sl]) |list| {
+        self.free_lists[fl][sl] = BlockHeader.init(addr, list);
+    } else {
+        self.free_lists[fl][sl] = BlockHeader.init(addr, null);
+    }
+}
+
 pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
     const self: *StaticAllocator = @ptrCast(@alignCast(ctx));
 
-    const fl, const sl = self.findLevels(n);
+    const fl, const sl = self.findFreeLevels(n) orelse return null; // not enough free room
     const list = self.free_lists[fl][sl] orelse std.process.fatal("Allocator lib bug: Bitmap does not match list! (size={d}, alignment='{s}', ret_addr={X:0>8})\n", .{ n, @tagName(alignment), return_address });
     list.remove();
-    const allocation_addr = @as([*]u8, @ptrCast(list));
-    const move = std.mem.alignForward(usize, @intFromPtr(allocation_addr), alignment.toByteUnits());
-
-    if (move > @sizeOf(BlockHeader)) {
-        // update list to contain this new free block of memory.
-
-    }
-    // if `move > 0` and `move < @sizeOf(BlockHeader)` this free memory should be recaptured upon freeing.
+    const allocation_addr = @intFromPtr(list);
+    const move = std.mem.alignForward(usize, allocation_addr, alignment.toByteUnits());
+    self.insertInList(allocation_addr, move);
 
     const block_size = self.sizeFromLevels(fl, sl);
     const remaining_space = block_size - n;
-
-    // we might have more than 0 bytes left, but less than `@sizeOf(BlockHeader)`, in which
-    // case these bytes are temporarily lost and should be "recaptured" in `free`.
-    if (remaining_space > @sizeOf(BlockHeader)) {
-        const fl_new, const sl_new = self.findLevels(remaining_space);
-        const new_block_addr = @intFromPtr(list) + remaining_space;
-        if (self.free_lists[fl_new][sl_new]) |prev| {
-            list.next_block = BlockHeader.init(new_block_addr, prev);
-        } else {
-            self.free_lists[fl_new][sl_new] = BlockHeader.init(new_block_addr, null);
-        }
-    }
+    self.insertInList(allocation_addr + move + n, remaining_space);
 
     self.free_lists[fl][sl] = null; // clear now used list
-    return allocation_addr + move;
+    return @ptrFromInt(allocation_addr + move);
 }
 
 pub fn resize(
