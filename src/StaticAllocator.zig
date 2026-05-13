@@ -1,3 +1,6 @@
+//! TODO:
+//! - [ ] Cache certain often-used values for optimization
+
 // std imports
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -76,7 +79,8 @@ inline fn upperBound(size: usize) usize {
 //  lowerBoundOf(size) = 2^(floor(log2(size)))
 fn sizeToLevels(self: *const StaticAllocator, size: usize) struct { Fl, Sl } {
     const lower_bound = lowerBound(size);
-    const fl = std.math.log2(self.max_block_size) * std.math.log2(lowerBound(size));
+
+    const fl = std.math.log2(lowerBound(size)) - std.math.log2(self.min_block_size);
     const sl = @divTrunc((size - lower_bound), (lower_bound / SL_COUNT));
     return .{ fl, sl };
 }
@@ -84,7 +88,7 @@ fn sizeToLevels(self: *const StaticAllocator, size: usize) struct { Fl, Sl } {
 // size =
 // (have to reverse above equations)
 fn flToSize(self: *const StaticAllocator, fl: Fl) usize {
-    return TODO;
+    return std.math.pow(usize, 2, std.math.log2(self.min_block_size) + fl);
 }
 
 fn sizeFromLevels(self: *const StaticAllocator, sl: Sl, fl: Fl) usize {
