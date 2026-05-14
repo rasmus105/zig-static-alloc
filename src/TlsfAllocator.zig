@@ -130,7 +130,14 @@ fn sizeToLevels(self: *const StaticAllocator, size: usize) struct { Fl, Sl } {
     const lower_bound = lowerBound(size);
 
     // - 1 since they are zero-indexed.
-    const fl: Fl = @intCast(std.math.log2(lower_bound) - std.math.log2(self.min_block_size) - 1);
+    const raw_fl = std.math.log2(lower_bound);
+    const raw_min_fl = std.math.log2(self.min_block_size);
+
+    if (raw_fl <= raw_min_fl) {
+        return .{ 0, 0 };
+    }
+
+    const fl: Fl = @intCast(raw_fl - raw_min_fl - 1);
     const sl: Sl = @intCast(@divTrunc((size - lower_bound), (lower_bound / SL_COUNT)));
     return .{ fl, sl };
 }
