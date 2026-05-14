@@ -159,8 +159,24 @@ fn sizeFromLevels(self: *const StaticAllocator, sl: Sl, fl: Fl) usize {
 
 /// finds Fl/Sl of the buffer with the closest size to allocate `n` bytes
 fn findFreeBlock(self: *const StaticAllocator, n: usize) ?struct { Fl, Sl } {
-    const min_fl, const min_sl = self.sizeToLevels(n);
+    const min_fl, const min_sl = blk: {
+        const fl, const sl = self.sizeToLevels(n);
+        if (self.free_lists[fl][sl]) |list| {
+            if (list.size < n) {
+                if (sl + 1 >= SL_COUNT) {
+                    break :blk .{ fl + 1, 0 };
+                } else {
+                    break :blk .{ fl, sl + 1 };
+                }
+            }
+            break :blk .{ fl, sl };
+        } else {
+            break :blk .{ fl, sl };
+        }
+    };
+
     const fl_candidates = self.fl_bitmap & (fl_bitmap_max << min_fl);
+    if (fl_candidates == 0) return null;
     const fl: Fl = @intCast(@ctz(fl_candidates)); // zero-indexed
 
     // if we are in the minimum fl, apply mask to sort out sl that won't fit `n`.
@@ -273,7 +289,7 @@ pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, return_add
     const self: *StaticAllocator = @ptrCast(@alignCast(ctx));
     const required_alignment = @max(alignment.toByteUnits(), @alignOf(BlockHeader));
 
-    const worst_case_n = @sizeOf(BlockHeader) + n + @max(required_alignment - 1, @sizeOf(BlockHeader));
+    const worst_case_n = 2 * @sizeOf(BlockHeader) + n + required_alignment - 1;
     const fl, const sl = self.findFreeBlock(worst_case_n) orelse return null;
     const block = self.free_lists[fl][sl].?; // if this fails bitmap has lied to us
     self.removeFreeBlock(block, fl, sl); // remove references to this block
@@ -281,6 +297,7 @@ pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, return_add
 
     std.debug.assert(block.size > 0);
 
+    // std.debug.print("aligned_addr={x:0>8}, block={x:0>8}\n", .{ aligned_addr, block.addr() });
     const padding = aligned_addr - block.addr() - @sizeOf(BlockHeader);
     std.debug.assert(padding > @sizeOf(BlockHeader));
 
