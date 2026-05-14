@@ -117,6 +117,19 @@ test upperBound {
     try std.testing.expectEqual(4, upperBound(3)); // 2^0
 }
 
+/// Round up to nearest SL bin.
+inline fn upperSlBound(size: usize) usize {
+    const lb = lowerBound(size);
+    const sl_bin_size = lb / SL_COUNT;
+
+    std.debug.assert(sl_bin_size != 0);
+
+    const rem = size % sl_bin_size;
+    if (rem == 0) return size;
+
+    return size + (sl_bin_size - rem);
+}
+
 // ====================================================================================================
 // Methods - TFSC specific math helpers
 // ====================================================================================================
@@ -159,21 +172,7 @@ fn sizeFromLevels(self: *const StaticAllocator, sl: Sl, fl: Fl) usize {
 
 /// finds Fl/Sl of the buffer with the closest size to allocate `n` bytes
 fn findFreeBlock(self: *const StaticAllocator, n: usize) ?struct { Fl, Sl } {
-    const min_fl, const min_sl = blk: {
-        const fl, const sl = self.sizeToLevels(n);
-        if (self.free_lists[fl][sl]) |list| {
-            if (list.size < n) {
-                if (sl + 1 >= SL_COUNT) {
-                    break :blk .{ fl + 1, 0 };
-                } else {
-                    break :blk .{ fl, sl + 1 };
-                }
-            }
-            break :blk .{ fl, sl };
-        } else {
-            break :blk .{ fl, sl };
-        }
-    };
+    const min_fl, const min_sl = self.sizeToLevels(upperSlBound(n));
 
     const fl_candidates = self.fl_bitmap & (fl_bitmap_max << min_fl);
     if (fl_candidates == 0) return null;
