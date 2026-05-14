@@ -51,6 +51,7 @@ const BlockHeader = struct {
 const FlBitmap = std.meta.Int(.unsigned, FL_COUNT);
 const SlBitmap = std.meta.Int(.unsigned, SL_COUNT);
 
+// note: These are zero-indexed. FL_COUNT may be 8, while Fl goes from 0-7.
 const Fl = std.math.Log2Int(std.meta.Int(.unsigned, FL_COUNT));
 const Sl = std.math.Log2Int(std.meta.Int(.unsigned, SL_COUNT));
 
@@ -74,12 +75,38 @@ buffer: []u8,
 // Methods - Math Helpers
 // ====================================================================================================
 
+/// Round `size` down to the closest `2^x` value
 inline fn lowerBound(size: usize) usize {
-    return std.math.pow(usize, 2, std.math.floor(std.math.log2(size)));
+    std.debug.assert(size > 0);
+
+    const shift: std.math.Log2Int(usize) =
+        @intCast(@bitSizeOf(usize) - 1 - @clz(size));
+
+    return @as(usize, 1) << shift;
 }
 
+test lowerBound {
+    try std.testing.expectEqual(1024, lowerBound(1221));
+    try std.testing.expectEqual(32, lowerBound(33));
+    try std.testing.expectEqual(1, lowerBound(1)); // 2^0
+    try std.testing.expectEqual(2, lowerBound(3)); // 2^0
+}
+
+/// Round `size` up to the closest `2^x` value
 inline fn upperBound(size: usize) usize {
-    return std.math.pow(usize, 2, std.math.ceil(std.math.log2(size)));
+    std.debug.assert(size > 0);
+
+    const lower = lowerBound(size);
+    if (lower == size) return size;
+
+    return lower << 1;
+}
+
+test upperBound {
+    try std.testing.expectEqual(2048, upperBound(1221));
+    try std.testing.expectEqual(64, upperBound(33));
+    try std.testing.expectEqual(1, upperBound(1)); // 2^0
+    try std.testing.expectEqual(4, upperBound(3)); // 2^0
 }
 
 // ====================================================================================================
@@ -94,8 +121,11 @@ inline fn upperBound(size: usize) usize {
 fn sizeToLevels(self: *const StaticAllocator, size: usize) struct { Fl, Sl } {
     const lower_bound = lowerBound(size);
 
-    const fl = std.math.log2(lowerBound(size)) - std.math.log2(self.min_block_size);
-    const sl = @divTrunc((size - lower_bound), (lower_bound / SL_COUNT));
+    std.debug.print("size = {d}\n", .{size});
+
+    // - 1 since they are zero-indexed.
+    const fl: Fl = @intCast(std.math.log2(lower_bound) - std.math.log2(self.min_block_size) - 1);
+    const sl: Sl = @intCast(@divTrunc((size - lower_bound), (lower_bound / SL_COUNT)));
     return .{ fl, sl };
 }
 
@@ -208,15 +238,14 @@ pub fn init(buffer: []u8) StaticAllocator {
         .max_block_size = upperBound(buffer.len + 1), // bounds are non-inclusive to the upper end, thus the +1
     };
 
-    const first_block: *BlockHeader = &buffer[0];
-    first_block.* = .{};
+    const first_block = BlockHeader.init(@intFromPtr(buffer.ptr), buffer.len, null);
 
     const fl, const sl = self.sizeToLevels(buffer.len);
 
     // only 1 block
     self.free_lists[fl][sl] = first_block;
-    self.fl_bitmap = 1 >> fl;
-    self.sl_bitmaps[fl] = 1 >> sl;
+    self.fl_bitmap = @as(FlBitmap, 1) >> fl;
+    self.sl_bitmaps[fl] = @as(SlBitmap, 1) >> sl;
 
     return self;
 }
@@ -311,5 +340,5 @@ pub fn free(
 
 test {
     // _ = @import(@src().file[0 .. filename.len - 4] ++ ".test.zig");
-    _ = @import("StaticAllocator.test.zig");
+    _ = @import("TlsfAllocator.test.zig");
 }
