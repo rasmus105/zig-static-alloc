@@ -40,16 +40,24 @@ const BlockHeader = struct {
     }
 
     pub fn from(address: usize) *BlockHeader {
+        std.debug.assert(address % @alignOf(BlockHeader) == 0);
         return @ptrFromInt(address);
     }
 
     inline fn addr(self: *const BlockHeader) usize {
         return @intFromPtr(self);
     }
+
+    inline fn end(self: *const BlockHeader) usize {
+        return self.addr() + self.size;
+    }
 };
 
 const FlBitmap = std.meta.Int(.unsigned, FL_COUNT);
 const SlBitmap = std.meta.Int(.unsigned, SL_COUNT);
+
+const fl_bitmap_max: FlBitmap = std.math.maxInt(FlBitmap);
+const sl_bitmap_max: SlBitmap = std.math.maxInt(SlBitmap);
 
 // note: These are zero-indexed. FL_COUNT may be 8, while Fl goes from 0-7.
 const Fl = std.math.Log2Int(std.meta.Int(.unsigned, FL_COUNT));
@@ -121,8 +129,6 @@ test upperBound {
 fn sizeToLevels(self: *const StaticAllocator, size: usize) struct { Fl, Sl } {
     const lower_bound = lowerBound(size);
 
-    std.debug.print("size = {d}\n", .{size});
-
     // - 1 since they are zero-indexed.
     const fl: Fl = @intCast(std.math.log2(lower_bound) - std.math.log2(self.min_block_size) - 1);
     const sl: Sl = @intCast(@divTrunc((size - lower_bound), (lower_bound / SL_COUNT)));
@@ -147,31 +153,30 @@ fn sizeFromLevels(self: *const StaticAllocator, sl: Sl, fl: Fl) usize {
 /// finds Fl/Sl of the buffer with the closest size to allocate `n` bytes
 fn findFreeBlock(self: *const StaticAllocator, n: usize) ?struct { Fl, Sl } {
     const min_fl, const min_sl = self.sizeToLevels(n);
+    const fl_candidates = self.fl_bitmap & (fl_bitmap_max << min_fl);
+    const fl: Fl = @intCast(@ctz(fl_candidates)); // zero-indexed
 
-    const shifted_fl_bitmap = self.fl_bitmap << min_fl;
+    // if we are in the minimum fl, apply mask to sort out sl that won't fit `n`.
+    const sl_candidates =
+        if (fl == min_fl) self.sl_bitmaps[fl] & (sl_bitmap_max << min_sl) else self.sl_bitmaps[fl];
 
-    if (shifted_fl_bitmap == 0) return null; // no free room
-    const leading_zeroes_fl = @clz(shifted_fl_bitmap);
-    const fl: Fl = @intCast(min_fl + leading_zeroes_fl);
+    if (sl_candidates == 0) {
+        // no sl candidates. If we are in the min fl, try finding a higher level
+        if (fl != min_fl) return null;
+        const fl_remaining_candidates = self.fl_bitmap & (fl_bitmap_max << (min_fl + 1));
+        if (fl_remaining_candidates == 0) return null; // no larger fl available.
+        const new_fl: Fl = @intCast(@ctz(fl_remaining_candidates));
 
-    const shifted_sl_bitmap = self.sl_bitmaps[fl] << min_sl;
-    if (shifted_sl_bitmap == 0) {
-        // have to go to next fl level - no sl level big enough here
-        const next_shifted_fl_bitmap = self.fl_bitmap << fl;
-        if (next_shifted_fl_bitmap == 0) return null;
-        const next_fl = @clz(next_shifted_fl_bitmap);
-        const next_shifted_sl_bitmap = self.sl_bitmaps[next_fl];
-        std.debug.assert(next_shifted_sl_bitmap != 0);
+        const new_sl_candidates = self.sl_bitmaps[new_fl];
+        const new_sl: Sl = @intCast(@ctz(new_sl_candidates));
 
-        const leading_zeroes_sl = @clz(shifted_sl_bitmap);
-        const sl: Sl = @intCast(min_sl + leading_zeroes_sl);
+        std.debug.assert(new_sl_candidates != 0);
 
-        return .{ @as(Fl, @intCast(fl)), @as(Sl, @intCast(sl)) };
+        return .{ new_fl, new_sl };
+    } else {
+        const sl: Sl = @intCast(@ctz(sl_candidates));
+        return .{ fl, sl };
     }
-    const leading_zeroes_sl = @clz(shifted_sl_bitmap);
-    const sl: Sl = @intCast(min_sl + leading_zeroes_sl);
-
-    return .{ fl, sl };
 }
 
 fn bitmapAdd(self: *StaticAllocator, fl: Fl, sl: Sl) void {
@@ -187,7 +192,7 @@ fn bitmapRemove(self: *StaticAllocator, fl: Fl, sl: Sl) void {
 }
 
 fn removeFreeBlock(self: *StaticAllocator, block: *BlockHeader, fl: Fl, sl: Sl) void {
-    std.debug.assert(self.free_lists[fl][sl] == null);
+    std.debug.assert(self.free_lists[fl][sl] != null);
 
     block.remove(); // remove references
     self.free_lists[fl][sl] = null;
@@ -239,13 +244,7 @@ pub fn init(buffer: []u8) StaticAllocator {
     };
 
     const first_block = BlockHeader.init(@intFromPtr(buffer.ptr), buffer.len, null);
-
-    const fl, const sl = self.sizeToLevels(buffer.len);
-
-    // only 1 block
-    self.free_lists[fl][sl] = first_block;
-    self.fl_bitmap = @as(FlBitmap, 1) >> fl;
-    self.sl_bitmaps[fl] = @as(SlBitmap, 1) >> sl;
+    self.insertFreeBlock(first_block);
 
     return self;
 }
@@ -265,22 +264,27 @@ pub fn allocator(self: *StaticAllocator) Allocator {
 pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
     _ = return_address;
     const self: *StaticAllocator = @ptrCast(@alignCast(ctx));
+    const required_alignment = @max(alignment.toByteUnits(), @alignOf(BlockHeader));
 
-    const worst_case_n = @sizeOf(BlockHeader) + n + @max(alignment.toByteUnits() - 1, @sizeOf(BlockHeader));
+    const worst_case_n = @sizeOf(BlockHeader) + n + @max(required_alignment - 1, @sizeOf(BlockHeader));
     const fl, const sl = self.findFreeBlock(worst_case_n) orelse return null;
     const block = self.free_lists[fl][sl].?; // if this fails bitmap has lied to us
     self.removeFreeBlock(block, fl, sl); // remove references to this block
-    const aligned_addr = std.mem.alignBackward(usize, block.addr() + block.size - n, alignment.toByteUnits());
+    const aligned_addr = std.mem.alignBackward(usize, block.end() - n, required_alignment);
+
+    std.debug.assert(block.size > 0);
 
     const padding = aligned_addr - block.addr() - @sizeOf(BlockHeader);
     std.debug.assert(padding > @sizeOf(BlockHeader));
 
     // initialize free block
+    const block_size = block.size; // first save block size before overwriting
     const new_free_block = BlockHeader.init(block.addr(), padding, block.prev_phys_block);
     self.insertFreeBlock(new_free_block);
 
     // initialize allocated block
-    _ = BlockHeader.init(aligned_addr - @sizeOf(BlockHeader), @sizeOf(BlockHeader) + n, new_free_block);
+    const allocated_block = BlockHeader.init(aligned_addr - @sizeOf(BlockHeader), block_size - padding, new_free_block);
+    std.debug.assert(allocated_block.size > 0);
     return @ptrFromInt(aligned_addr);
 }
 
@@ -326,7 +330,10 @@ pub fn free(
     _ = return_address;
     const self: *StaticAllocator = @ptrCast(@alignCast(ctx));
 
-    const block: *BlockHeader = @ptrCast(@alignCast(buf.ptr - @sizeOf(BlockHeader)));
+    const addr = @intFromPtr(buf.ptr) - @sizeOf(BlockHeader);
+    const block = BlockHeader.from(addr);
+    std.debug.assert(block.size > 0);
+
     if (block.prev_phys_block) |prev| {
         self.mergeBlocks(prev, block);
     } else {

@@ -7,9 +7,9 @@ test "basic" {
     var tlsf = TlsfAllocator.init(&buf);
     const allocator = tlsf.allocator();
 
-    const slice1 = try allocator.alloc(u8, 2048);
-    const slice2 = try allocator.alloc(u8, 512);
-
+    const slice1 = try allocator.alloc(u8, 548);
     allocator.free(slice1);
+
+    const slice2 = try allocator.alloc(u8, 512);
     allocator.free(slice2);
 }
