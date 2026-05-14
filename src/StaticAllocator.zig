@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const StaticAllocator = @This();
 
 const BlockHeader = struct {
+    prev_phys_block: ?*BlockHeader = null,
     next_block: ?*BlockHeader = null,
     prev_block: ?*BlockHeader = null,
     size: usize,
@@ -19,21 +20,12 @@ const BlockHeader = struct {
     pub fn init(addr: usize, size: usize, prev_block: ?*BlockHeader) *BlockHeader {
         const ptr: *BlockHeader = @ptrFromInt(addr);
         ptr.* = BlockHeader{
+            .prev_phys_block = null;
             .next_block = null,
             .prev_block = prev_block,
             .siez = size,
         };
         return ptr;
-    }
-
-    pub fn remove(self: *BlockHeader) void {
-        if (self.prev_block) |prev_block| {
-            if (self.next_block) |next_block| {
-                prev_block.*.next_block = next_block;
-            } else {
-                prev_block.*.next_block = null;
-            }
-        }
     }
 
     inline fn addr(self: *const BlockHeader) usize {
@@ -118,7 +110,21 @@ fn findFreeLevels(self: *const StaticAllocator, n: usize) ?struct { Fl, Sl } {
     const fl = min_fl + leading_zeroes_fl;
 
     const shifted_sl_bitmap = self.sl_bitmaps[fl] << min_sl;
-    std.debug.assert(shifted_sl_bitmap != 0); // fl should not have indicated free room here
+    if (shifted_sl_bitmap == 0) {
+        // have to go to next fl level - no sl level big enough here
+        const next_shifted_fl_bitmap = self.fl_bitmap << fl;
+        if (next_shifted_fl_bitmap == 0) return null;
+        const next_fl = @clz(next_shifted_fl_bitmap);
+        const next_shifted_sl_bitmap = self.sl_bitmaps[next_fl];
+        std.debug.assert(next_shifted_sl_bitmap != 0);
+
+        const leading_zeroes_sl = @clz(shifted_sl_bitmap);
+        const sl = min_sl + leading_zeroes_sl;
+
+        std.debug.assert(fl <= std.math.maxInt(Fl));
+        std.debug.assert(sl <= std.math.maxInt(Sl));
+        return .{ @as(Fl, @intCast(fl)), @as(Sl, @intCast(sl)) };
+    }
     const leading_zeroes_sl = @clz(shifted_sl_bitmap);
     const sl = min_sl + leading_zeroes_sl;
 
@@ -173,6 +179,18 @@ pub fn allocator(self: *StaticAllocator) Allocator {
     };
 }
 
+fn bitmapAdd(self: *StaticAllocator, fl: Fl, sl: Sl) void {
+    self.fl_bitmap |= 1 << fl;
+    self.sl_bitmaps[fl] |= 1 << sl;
+}
+
+fn bitmapRemove(self: *StaticAllocator, fl: Fl, sl: Sl) void {
+    self.sl_bitmaps[fl] &= ~(1 << sl);
+    if (self.sl_bitmaps[fl] == 0) { // only clear once entire second level becomes empty.
+        self.fl_bitmap &= ~(1 << fl);
+    }
+}
+
 /// Insert some bytes of allocated memory in list
 fn insertInList(self: *StaticAllocator, addr: usize, n: usize) void {
     std.debug.assert(n >= @sizeOf(BlockHeader));
@@ -181,60 +199,49 @@ fn insertInList(self: *StaticAllocator, addr: usize, n: usize) void {
         self.free_lists[fl][sl] = BlockHeader.init(addr, list);
     } else {
         self.free_lists[fl][sl] = BlockHeader.init(addr, null);
+        self.bitmapAdd(fl, sl);
     }
 }
 
+fn removeFromList(self: *StaticAllocator, fl: Fl, sl: Sl) void {
+    const block = self.free_lists[fl][sl].?; // if this fails, the bitmap has lied to us
+    if (block.prev_block) |prev_block| {
+        if (block.next_block) |next_block| {
+            prev_block.*.next_block = next_block;
+        } else {
+            prev_block.*.next_block = null;
+        }
+    } else {
+        // no more blocks in this fl/sl, update bitmap
+        self.bitmapRemove(fl, sl);
+    }
+
+    self.free_lists[fl][sl] = null;
+}
+
+pub fn remove(self: *BlockHeader) void {
+    if (self.prev_block) |prev_block| {
+        if (self.next_block) |next_block| {
+            prev_block.*.next_block = next_block;
+        } else {
+            prev_block.*.next_block = null;
+        }
+    }
+}
 pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
     const self: *StaticAllocator = @ptrCast(@alignCast(ctx));
 
-    const min_fl, const min_sl = self.sizeToLevels(n);
-    const lz_fl = @clz(self.fl_bitmap << min_fl);
-    if (lz_fl == @bitSizeOf(Fl)) return null; // not enough room
-    if (lz_fl == 0) {
-        // possibly an exact match!
-        const fl = lz_fl + min_fl;
-        const lz_sl = @clz(self.sl_bitmaps[fl] << min_sl);
-        const sl = lz_sl + min_sl;
-
-        const block = self.free_lists[fl][sl] orelse @panic("found bug!");
-        const aligned_addr = std.mem.alignForward(usize, block.addr(), alignment);
-        const padding = aligned_addr - block.addr();
-        if (block.size == n and padding == 0) {
-            // perfect match
-        } else if (block.size - n - padding > @sizeOf(StaticAllocator)) {
-            // can fit allocation + new block
-
-        } else {
-            // this block doesn't work for us, find next available block
-            const next_sl = @clz(self.sl_bitmaps[fl] << sl);
-            if (next_sl == @bitSizeOf(Sl)) {
-                // no more sl in this fl, look for next fl
-                const next_fl = @clz(self.fl_bitmap << fl);
-                if (next_fl == @bitSizeOf(Fl)) return null;
-
-                // found fl, repeat check...
-                // ... todo ...
-            } else {
-                // found block, lets check again if it works for us. 
-            }
-        }
+    const worst_case_n = n + @max(alignment.toByteUnits() - 1, @sizeOf(BlockHeader));
+    const fl, const sl = self.findFreeLevels(worst_case_n) orelse return null;
+    const block = self.free_lists[fl][sl].?; // if this fails bitmap has lied to us
+    const aligned_addr = std.mem.alignBackward(u8, block.addr() + block.size - n, alignment);
+    const padding = aligned_addr - block.addr();
+    if (padding > 0) {
+        std.debug.assert(padding > @sizeOf(BlockHeader));
+        self.insertInList(block.addr(), padding);
     }
 
-
-
-
-
-    // TODO: Optimization - `if (findExactLevels(n)) { ... }`
-    const required_size = n + @max(@sizeOf(BlockHeader), alignment.toByteUnits() - 1);
-    const fl, const sl = self.findFreeLevels(required_size) orelse return null; // not enough free room
-    const block = self.free_lists[fl][sl] orelse std.process.fatal("Allocator lib bug: Bitmap does not match list! (size={d}, alignment='{s}', ret_addr={X:0>8})\n", .{ n, @tagName(alignment), return_address });
-    block.remove(); // remove all references to block
-    const aligned_addr = std.mem.alignForward(usize, block.addr()+@sizeOf(BlockHeader), alignment.toByteUnits());
-    const padding = aligned_addr - block.addr();
-    if (
-    self.insertInList(block.addr(), padding); // add back padding
-
-    self.free_lists[fl][sl] = null; // clear now used list
+    self.removeFromList(fl, sl);
     return @ptrFromInt(aligned_addr);
 }
 
@@ -278,7 +285,8 @@ pub fn free(
 ) void {
     // TODO: is it even possible to recapture "lost" space?
     const self: *StaticAllocator = @ptrCast(@alignCast(ctx));
-    const addr = memory.ptr;
+    const addr = @intFromPtr(buf.ptr);
+    self.insertInList(addr, buf.len);
 
     _ = self;
     _ = buf;
