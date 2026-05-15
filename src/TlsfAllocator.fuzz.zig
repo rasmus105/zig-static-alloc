@@ -9,6 +9,7 @@ test "basic allocator fuzz" {
         .{ .corpus = &.{
             corpus.basic_allocator_fuzz_crash001,
             corpus.basic_allocator_fuzz_crash002,
+            corpus.basic_allocator_fuzz_crash003,
         } },
     );
 }

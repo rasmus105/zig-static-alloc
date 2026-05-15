@@ -198,7 +198,7 @@ fn sizeFromLevels(self: *const StaticAllocator, fl: Fl, sl: Sl) usize {
 
 /// finds Fl/Sl of the buffer with the closest size to allocate `n` bytes
 fn findFreeBlock(self: *const StaticAllocator, n: usize) ?struct { Fl, Sl } {
-    const upper_sl = if (n < self.min_block_size) upperSlBound(self.min_block_size + 1) else upperSlBound(n);
+    const upper_sl = upperSlBound(@max(n, self.min_block_size));
     const min_fl, const min_sl = self.sizeToLevels(upper_sl);
 
     const fl_candidates = self.fl_bitmap & (fl_bitmap_max << min_fl);
@@ -212,6 +212,7 @@ fn findFreeBlock(self: *const StaticAllocator, n: usize) ?struct { Fl, Sl } {
     if (sl_candidates == 0) {
         // no sl candidates. If we are in the min fl, try finding a higher level
         if (fl != min_fl) return null;
+        if (min_fl == FL_COUNT - 1) return null;
         const fl_remaining_candidates = self.fl_bitmap & (fl_bitmap_max << (min_fl + 1));
         if (fl_remaining_candidates == 0) return null; // no larger fl available.
         const new_fl: Fl = @intCast(@ctz(fl_remaining_candidates));
@@ -290,7 +291,7 @@ pub fn init(buffer: []u8) StaticAllocator {
     var self = StaticAllocator{
         .buffer = buffer,
         .max_block_size = max_block_size,
-        .min_block_size = lowerBound(max_block_size) / (std.math.pow(usize, 2, @intCast(FL_COUNT))),
+        .min_block_size = @max(SL_COUNT, lowerBound(max_block_size) / (std.math.pow(usize, 2, @intCast(FL_COUNT)))),
     };
 
     const first_block = BlockHeader.init(@intFromPtr(buffer.ptr), buffer.len, null);
@@ -316,7 +317,7 @@ pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, return_add
     const self: *StaticAllocator = @ptrCast(@alignCast(ctx));
     const required_alignment = @max(alignment.toByteUnits(), @alignOf(BlockHeader));
 
-    const worst_case_n = 2 * @sizeOf(BlockHeader) + n + required_alignment - 1;
+    const worst_case_n = self.min_block_size + @sizeOf(BlockHeader) + n + required_alignment - 1;
     const fl, const sl = self.findFreeBlock(worst_case_n) orelse return null;
     const block = self.free_lists[fl][sl].?; // if this fails bitmap has lied to us
     self.removeFreeBlock(block, fl, sl); // remove references to this block
@@ -325,7 +326,7 @@ pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, return_add
 
     // std.debug.print("aligned_addr={x:0>8}, block={x:0>8}\n", .{ aligned_addr, block.addr() });
     const padding = aligned_addr - block.addr() - @sizeOf(BlockHeader);
-    std.debug.assert(padding >= @sizeOf(BlockHeader));
+    std.debug.assert(padding >= self.min_block_size);
 
     // initialize free block
     const block_size = block.size; // first save block size before overwriting
