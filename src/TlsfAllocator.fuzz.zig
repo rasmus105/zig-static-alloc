@@ -8,6 +8,7 @@ test "basic allocator fuzz" {
         basicFuzzTest,
         .{ .corpus = &.{
             corpus.basic_allocator_fuzz_crash001,
+            corpus.basic_allocator_fuzz_crash002,
         } },
     );
 }

@@ -67,7 +67,6 @@ const Sl = std.math.Log2Int(std.meta.Int(.unsigned, SL_COUNT));
 // Methods
 // ====================================================================================================
 
-buffer_size: usize,
 min_block_size: usize, // calculated once upon initialization
 max_block_size: usize,
 free_lists: [FL_COUNT][SL_COUNT]?*BlockHeader = @splat(@splat(null)),
@@ -80,7 +79,21 @@ sl_bitmaps: [FL_COUNT]SlBitmap = @splat(0),
 buffer: []u8,
 
 // ====================================================================================================
-// Methods - Math Helpers
+// Methods for debugging
+// ====================================================================================================
+
+fn printLevels(self: *const StaticAllocator) void {
+    for (0..FL_COUNT) |fl| {
+        std.debug.print("> fl = {d}\n", .{fl});
+        for (0..SL_COUNT) |sl| {
+            const _size = self.sizeFromLevels(@intCast(fl), @intCast(sl));
+            std.debug.print("    |> sl = {d}, [{d}, {d})\n", .{ sl, _size, upperSlBound(_size + 1) });
+        }
+    }
+}
+
+// ====================================================================================================
+// Methods
 // ====================================================================================================
 
 /// Round `size` down to the closest `2^x` value
@@ -97,7 +110,8 @@ test lowerBound {
     try std.testing.expectEqual(1024, lowerBound(1221));
     try std.testing.expectEqual(32, lowerBound(33));
     try std.testing.expectEqual(1, lowerBound(1)); // 2^0
-    try std.testing.expectEqual(2, lowerBound(3)); // 2^0
+    try std.testing.expectEqual(2, lowerBound(3));
+    try std.testing.expectEqual(16, lowerBound(18));
 }
 
 /// Round `size` up to the closest `2^x` value
@@ -130,8 +144,12 @@ inline fn upperSlBound(size: usize) usize {
     return size + (sl_bin_size - rem);
 }
 
+// test upperSlBound {
+//     try std.testing.expectEqual(expected: anytype, actual: anytype)
+// }
+
 // ====================================================================================================
-// Methods - TFSC specific math helpers
+// Methods
 // ====================================================================================================
 
 // Fl = log2(max_block_size) * log2(lowerBoundOf(size))
@@ -140,19 +158,27 @@ inline fn upperSlBound(size: usize) usize {
 //  lowerBoundOf(size) = 2^(floor(log2(size)))
 /// Find closest matching bin
 fn sizeToLevels(self: *const StaticAllocator, size: usize) struct { Fl, Sl } {
-    const lower_bound = lowerBound(size);
+    const mapped_size = @max(size, self.min_block_size);
+    const lower_bound = lowerBound(mapped_size);
 
     // - 1 since they are zero-indexed.
     const raw_fl = std.math.log2(lower_bound);
     const raw_min_fl = std.math.log2(self.min_block_size);
 
-    if (raw_fl <= raw_min_fl) {
-        return .{ 0, 0 };
-    }
-
-    const fl: Fl = @intCast(raw_fl - raw_min_fl - 1);
-    const sl: Sl = @intCast(@divTrunc((size - lower_bound), (lower_bound / SL_COUNT)));
+    const fl: Fl = @intCast(raw_fl - raw_min_fl);
+    const sl: Sl = @intCast(@divTrunc((mapped_size - lower_bound), (lower_bound / SL_COUNT)));
     return .{ fl, sl };
+}
+
+test sizeToLevels {
+    var buffer: [4096]u8 = undefined;
+    const self = StaticAllocator.init(&buffer);
+
+    // TODO could optimize by not allowing >= 4096 allocations (min_block_size would become half)
+    try std.testing.expectEqual(.{ 0, 0 }, self.sizeToLevels(18));
+    try std.testing.expectEqual(.{ 5, 2 }, self.sizeToLevels(1401));
+    try std.testing.expectEqual(.{ 6, 7 }, self.sizeToLevels(4095));
+    try std.testing.expectEqual(.{ 7, 0 }, self.sizeToLevels(4096));
 }
 
 // size =
@@ -161,18 +187,19 @@ fn flToSize(self: *const StaticAllocator, fl: Fl) usize {
     return std.math.pow(usize, 2, std.math.log2(self.min_block_size) + fl);
 }
 
-fn sizeFromLevels(self: *const StaticAllocator, sl: Sl, fl: Fl) usize {
+fn sizeFromLevels(self: *const StaticAllocator, fl: Fl, sl: Sl) usize {
     const lower_bound_size = self.flToSize(fl);
     return (lower_bound_size / SL_COUNT) * sl + lower_bound_size;
 }
 
 // ====================================================================================================
-// Methods - "high level"
+// Methods
 // ====================================================================================================
 
 /// finds Fl/Sl of the buffer with the closest size to allocate `n` bytes
 fn findFreeBlock(self: *const StaticAllocator, n: usize) ?struct { Fl, Sl } {
-    const min_fl, const min_sl = self.sizeToLevels(upperSlBound(n));
+    const upper_sl = if (n < self.min_block_size) upperSlBound(self.min_block_size + 1) else upperSlBound(n);
+    const min_fl, const min_sl = self.sizeToLevels(upper_sl);
 
     const fl_candidates = self.fl_bitmap & (fl_bitmap_max << min_fl);
     if (fl_candidates == 0) return null;
@@ -259,11 +286,11 @@ pub const FL_COUNT = 8;
 // ====================================================================================================
 
 pub fn init(buffer: []u8) StaticAllocator {
+    const max_block_size = upperBound(buffer.len + 1); // bounds are non-inclusive to the upper end, thus the +1
     var self = StaticAllocator{
-        .buffer_size = buffer.len,
         .buffer = buffer,
-        .min_block_size = lowerBound(buffer.len) / (std.math.pow(usize, 2, @intCast(FL_COUNT))),
-        .max_block_size = upperBound(buffer.len + 1), // bounds are non-inclusive to the upper end, thus the +1
+        .max_block_size = max_block_size,
+        .min_block_size = lowerBound(max_block_size) / (std.math.pow(usize, 2, @intCast(FL_COUNT))),
     };
 
     const first_block = BlockHeader.init(@intFromPtr(buffer.ptr), buffer.len, null);
@@ -294,7 +321,6 @@ pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, return_add
     const block = self.free_lists[fl][sl].?; // if this fails bitmap has lied to us
     self.removeFreeBlock(block, fl, sl); // remove references to this block
     const aligned_addr = std.mem.alignBackward(usize, block.end() - n, required_alignment);
-
     std.debug.assert(block.size >= worst_case_n);
 
     // std.debug.print("aligned_addr={x:0>8}, block={x:0>8}\n", .{ aligned_addr, block.addr() });
