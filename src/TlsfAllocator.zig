@@ -295,11 +295,11 @@ pub fn alloc(ctx: *anyopaque, n: usize, alignment: std.mem.Alignment, return_add
     self.removeFreeBlock(block, fl, sl); // remove references to this block
     const aligned_addr = std.mem.alignBackward(usize, block.end() - n, required_alignment);
 
-    std.debug.assert(block.size > 0);
+    std.debug.assert(block.size >= worst_case_n);
 
     // std.debug.print("aligned_addr={x:0>8}, block={x:0>8}\n", .{ aligned_addr, block.addr() });
     const padding = aligned_addr - block.addr() - @sizeOf(BlockHeader);
-    std.debug.assert(padding > @sizeOf(BlockHeader));
+    std.debug.assert(padding >= @sizeOf(BlockHeader));
 
     // initialize free block
     const block_size = block.size; // first save block size before overwriting
