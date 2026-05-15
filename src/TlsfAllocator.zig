@@ -216,8 +216,9 @@ fn bitmapRemove(self: *StaticAllocator, fl: Fl, sl: Sl) void {
 fn removeFreeBlock(self: *StaticAllocator, block: *BlockHeader, fl: Fl, sl: Sl) void {
     std.debug.assert(self.free_lists[fl][sl] != null);
 
-    block.remove(); // remove references
-    self.free_lists[fl][sl] = null;
+    const remaining_block = if (block.prev_block) |b| b else if (block.next_block) |b| b else null;
+    block.remove(); // remove references to block
+    self.free_lists[fl][sl] = remaining_block;
     self.bitmapRemove(fl, sl);
 }
 
@@ -371,4 +372,5 @@ pub fn free(
 test {
     // _ = @import(@src().file[0 .. filename.len - 4] ++ ".test.zig");
     _ = @import("TlsfAllocator.test.zig");
+    _ = @import("TlsfAllocator.fuzz.zig");
 }
